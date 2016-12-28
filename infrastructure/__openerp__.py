@@ -27,7 +27,7 @@
     'license': 'AGPL-3',
     'depends': [
         'mail',
-        'web_widget_many2many_tags_multi_selection',
+        # 'web_widget_many2many_tags_multi_selection',
         'server_mode',
         # 'web_ir_actions_act_window_message',
     ],
@@ -54,7 +54,6 @@
         'view/base_module_view.xml',
         'view/server_hostname_view.xml',
         'view/instance_host_view.xml',
-        'view/partner_view.xml',
         'view/mailserver_view.xml',
         'view/repository_view.xml',
         'view/odoo_version_view.xml',

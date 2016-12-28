@@ -5,7 +5,7 @@
 ##############################################################################
 
 from openerp import fields, api, models
-from openerp.exceptions import Warning
+from openerp.exceptions import ValidationError
 import logging
 _logger = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ class infrastructure_instance_update(models.Model):
     @api.multi
     def action_confirm(self):
         if not self.detail_ids.filtered(lambda x: x.state == 'to_run'):
-            raise Warning('There are no lines to run')
+            raise ValidationError('There are no lines to run')
         self.write({'state': 'to_run'})
 
     @api.multi
@@ -253,7 +253,7 @@ class infrastructure_instance_update_detail(models.Model):
     @api.multi
     def view_result(self):
         self.ensure_one()
-        raise Warning(self.result)
+        raise ValidationError(self.result)
 
     @api.multi
     def action_open_instance(self):

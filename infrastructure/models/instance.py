@@ -4,9 +4,11 @@
 # directory
 ##############################################################################
 from openerp import models, fields, api, _
-from openerp.exceptions import except_orm, Warning
+from openerp.exceptions import except_orm, ValidationError
 from .server import custom_sudo as sudo
 from fabric.contrib.files import exists, append, sed
+import random
+import string
 import os
 import re
 import logging
@@ -598,7 +600,13 @@ class instance(models.Model):
             if self.server_id.server_use_type == 'own' and instance_admin_pass:
                 admin_pass = instance_admin_pass or self.name
             else:
-                admin_pass = self.name
+                # use random pass
+                chars = string.ascii_letters + string.digits
+                # no usamos estas porque nos dan error con docker
+                # + '!@#$%^&*()'
+                random.seed = (os.urandom(1024))
+                admin_pass = ''.join(random.choice(chars) for i in range(20))
+                # admin_pass = self.name
             self.admin_pass = admin_pass
             self.db_filter = self.database_type_id.db_filter
             self.service_type = self.database_type_id.service_type
@@ -619,7 +627,7 @@ class instance(models.Model):
 
     @api.multi
     def action_check_databases(self):
-        raise Warning('Not implemented yet')
+        raise ValidationError('Not implemented yet')
         # return self.database_ids.xx
 
     @api.multi
@@ -648,28 +656,31 @@ class instance(models.Model):
     @api.constrains('number')
     def _check_number(self):
         if not self.number or self.number < 1 or self.number > 9:
-            raise Warning(_('Number should be between 1 and 9'))
+            raise ValidationError(_('Number should be between 1 and 9'))
 
     @api.one
     def unlink(self):
         if self.state not in ('draft', 'cancel'):
-            raise Warning(_(
+            raise ValidationError(_(
                 'You cannot delete an instance which '
                 'is not draft or cancelled.'))
         return super(instance, self).unlink()
 
 # Calculated fields
     @api.one
-    @api.depends('environment_id')
+    @api.depends('environment_id', 'odoo_image_id.odoo_server_wide_modules')
     def _get_module_load(self):
         if self.sources_type == 'use_from':
-            module_load = self.sources_from_id.module_load
-        module_load = ','.join(
-            [x.repository_id.server_wide_modules for x in (
-                self.instance_repository_ids) if (
-                    x.repository_id.server_wide_modules)])
-        if module_load:
-            self.module_load = 'web,web_kanban,' + module_load
+            self.module_load = self.sources_from_id.module_load
+        else:
+            module_load = ','.join(
+                [x.repository_id.server_wide_modules for x in (
+                    self.instance_repository_ids) if (
+                        x.repository_id.server_wide_modules)])
+            # if module_load:
+            self.module_load = (
+                (self.odoo_image_id.odoo_server_wide_modules or '') +
+                (module_load or ''))
 
     @api.one
     @api.depends('database_ids')
@@ -850,14 +861,28 @@ class instance(models.Model):
         self.data_dir = data_dir
 
 # Actions
+    @api.one
+    def check_protection(self):
+        """
+        Generic function used to ask if we can delete or overwrite an instance
+        if by_pass_protection is sent in context, then, no checks are done
+        """
+        if self._context.get('by_pass_protection', False):
+            return True
+        if self.advance_type == 'protected':
+            raise ValidationError(_(
+                'Action Forbiden! Instance is protected! '
+                'You can change type.'))
+        protected_dbs = self.database_ids.filtered('protected')
+        if protected_dbs:
+            raise ValidationError(_(
+                'Action Forbiden! Databases %s are protected!' % (
+                    protected_dbs.ids)))
+
     @api.multi
     def delete(self):
         _logger.info("Deleting Instance")
-        by_pass_protection = self._context.get('by_pass_protection', False)
-        if self.advance_type == 'protected' and not by_pass_protection:
-            raise Warning(_(
-                'You can not delete an instance that is of type protected,'
-                ' you can change type, or drop it manually'))
+        self.check_protection()
         self.database_ids.action_cancel()
         self.instance_repository_ids.write({'actual_commit': False})
         self.remove_odoo_service()
@@ -871,14 +896,18 @@ class instance(models.Model):
         _logger.info("Creating Instance")
         self.make_paths()
         self.update_nginx_site()
-        self.add_repositories()
-        self.instance_repository_ids.repository_pull_clone_and_checkout(
-            update=False)
+        # we only pull repositories if image has an extra addons dir set
+        if self.odoo_image_id.odoo_extra_addons_dir:
+            self.add_repositories()
+            self.instance_repository_ids.repository_pull_clone_and_checkout(
+                update=False)
         # remove containers if the exists
         self.remove_odoo_service()
         self.remove_pg_service()
         self.run_pg_service()
-        self.update_conf_file()
+        # we only pull repositories if image has an etc dir set
+        if self.odoo_image_id.odoo_etc_dir:
+            self.update_conf_file()
         self.run_odoo_service()
         self.action_activate()
 
@@ -890,11 +919,31 @@ class instance(models.Model):
         odoo_port_links = (
             '-p 127.0.0.1:%i:8069 -p 127.0.0.1:%i:8072') % (
             self.xml_rpc_port, self.longpolling_port)
-        odoo_volume_links = (
-            '-v %s:/etc/odoo -v %s:/mnt/extra-addons -v %s:/var/lib/odoo '
-            '-v %s:%s') % (
-            self.conf_path, self.sources_path, self.data_dir,
+        odoo_volume_links = '-v %s:%s ' % (
+            self.data_dir, self.odoo_image_id.odoo_data_dir)
+
+        if self.odoo_image_id.odoo_etc_dir:
+            odoo_volume_links += '-v %s:%s ' % (
+                self.conf_path, self.odoo_image_id.odoo_etc_dir)
+
+        if self.odoo_image_id.odoo_extra_addons_dir:
+            odoo_volume_links += '-v %s:%s ' % (
+                self.sources_path, self.odoo_image_id.odoo_extra_addons_dir)
+
+        odoo_volume_links += '-v %s:%s ' % (
             self.server_id.backups_path, self.server_id.backups_path)
+
+        odoo_volume_links += '-e WORKERS=%s ' % self.workers
+        odoo_volume_links += '-e ADMIN_PASSWORD=%s ' % self.admin_pass
+        odoo_volume_links += '-e DB_MAXCONN=%s ' % self.db_maxconn
+        odoo_volume_links += '-e LIMIT_TIME_CPU=%s ' % self.limit_time_cpu
+        odoo_volume_links += '-e LIMIT_TIME_REAL=%s ' % self.limit_time_real
+        server_mode_value = self.database_type_id.server_mode_value
+        odoo_volume_links += '-e SERVER_MODE=%s ' % (
+            server_mode_value or '')
+        if self.module_load:
+            odoo_volume_links += '-e SERVER_WIDE_MODULES=%s ' % (
+                self.module_load)
 
         odoo_pg_link = '--link %s:db' % self.pg_container
 
@@ -1005,7 +1054,7 @@ class instance(models.Model):
                 self.pg_container))
         tunnel_to_pg = "ssh -L 5499:%s:5432 %s@%s -p %i" % (
             ip, server.user_name, server.main_hostname, server.ssh_port)
-        raise Warning(_('Tunneling command to access postgres:\n%s\n'
+        raise ValidationError(_('Tunneling command to access postgres:\n%s\n'
             'Password: %s\n'
             'In your pgadmin you should enter:\n'
             '*Host: localhost\n'
@@ -1127,10 +1176,7 @@ class instance(models.Model):
     @api.one
     def copy_databases_from(self, instance):
         # TODO implement overwrite
-        if self.database_type_id.type == 'protected':
-            raise Warning(
-                'You can not replace data in a instance of type'
-                ' protected, you should do it manually or change type.')
+        self.check_protection()
         self.server_id.get_env()
         _logger.info('Copying database data from %s to %s' % (
             instance.name, self.name))
@@ -1241,7 +1287,7 @@ class instance(models.Model):
                 "Running update conf command: '%s'" % self.update_conf_cmd)
             sudo(self.update_conf_cmd)
         except Exception, e:
-            raise Warning(_(
+            raise ValidationError(_(
                 "Can not create/update configuration file, "
                 "this is what we get: \n %s") % (
                 e))
@@ -1433,7 +1479,7 @@ class instance(models.Model):
     def update_nginx_site(self):
         _logger.info("Updating nginx site")
         if not self.main_hostname:
-            raise Warning(_(
+            raise ValidationError(_(
                 'Can Not Configure Nginx if Main Site is not Seted!'))
 
         self.environment_id.server_id.get_env()
@@ -1442,7 +1488,7 @@ class instance(models.Model):
             x.name for x in self.instance_host_ids if (
                 x.type != 'redirect_to_main')]
         if not server_names:
-            raise Warning(_('You Must set at least one instance host!'))
+            raise ValidationError(_('You Must set at least one instance host!'))
 
         acces_log = os.path.join(
             self.environment_id.server_id.nginx_log_path,
@@ -1452,12 +1498,14 @@ class instance(models.Model):
             'error_' + re.sub('[-]', '_', self.name))
         xmlrpc_port = self.xml_rpc_port
 
-        # TODO modify template in order to give posibility to not use
-        # longpolling
+        # we only use longpolling if workers is set
+        longpolling = (
+            self.workers and nginx_longpolling_template % self.name or '')
+
         if self.type == 'secure':
             server_hostname_id = self.main_hostname_id.server_hostname_id
             if not self.main_hostname_id.server_hostname_id.ssl_available:
-                raise Warning(
+                raise ValidationError(
                     'To use Secure you nead a host with SSL enable. '
                     '\nCustom certificate is not implemented yet!')
             nginx_site_file = nginx_ssl_site_template % (
@@ -1473,7 +1521,7 @@ class instance(models.Model):
                 error_log,
                 self.name,
                 self.name,
-                self.name,
+                longpolling,
             )
         else:
             nginx_site_file = nginx_site_template % (
@@ -1489,7 +1537,7 @@ class instance(models.Model):
                 error_log,
                 self.name,
                 self.name,
-                self.name,
+                longpolling,
             )
 
         default_redirect_server_names = [
@@ -1523,7 +1571,7 @@ class instance(models.Model):
         # Check nginx sites-enabled directory exists
         nginx_sites_path = self.environment_id.server_id.nginx_sites_path
         if not exists(nginx_sites_path):
-            raise Warning(_(
+            raise ValidationError(_(
                 "Nginx '%s' directory not found! "
                 "Check if Nginx is installed!") % nginx_sites_path)
 
@@ -1572,11 +1620,19 @@ class instance(models.Model):
 
 # TODO llevar esto a un archivo y leerlo de alli
     # rewrite  ^/(.*)$  http://%s/$1 permanent;
+
+
 nginx_redirect_template = """
 server   {
     server_name %s;
     rewrite  ^/(.*)$  %s/$1 permanent;
 }
+"""
+
+nginx_longpolling_template = """
+    location /longpolling {
+        proxy_pass http://%s-im;
+    }
 """
 
 nginx_site_template = """
@@ -1628,9 +1684,7 @@ server {
         proxy_pass http://%s;
     }
 
-    location /longpolling {
-        proxy_pass http://%s-im;
-    }
+%s
 }
 """
 
@@ -1704,9 +1758,7 @@ server {
         proxy_pass http://%s;
     }
 
-    location /longpolling {
-        proxy_pass http://%s-im;
-    }
+%s
 }
 """
 # odoo_upstar = template_upstar_file % ()
